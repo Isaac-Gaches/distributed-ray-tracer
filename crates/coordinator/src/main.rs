@@ -1,0 +1,148 @@
+use std::io;
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU32;
+use std::thread;
+use ray_tracer::{receive_message, save_png, send_message, Camera, Geometry, Material, MaterialKind, Message, Object, Scene, Tile, Vec3};
+
+const CHUNKS: u32 = 16;
+const WORKERS: usize = 2;
+
+fn handle_client(
+    mut stream: TcpStream,
+    camera: Camera,
+    scene: Scene,
+    jobs: Arc<Mutex<Vec<Message>>>,
+    result: Arc<Mutex<Vec<u8>>>,
+) -> io::Result<()> {
+    println!("Handling a client");
+
+    let image_width = camera.width;
+    let chunk_height = camera.height/CHUNKS;
+
+    send_message(&mut stream,&Message::Scene {
+        camera,
+        scene,
+    })?;
+
+    send_message(&mut stream,&jobs.lock().unwrap().pop().unwrap())?;
+
+    loop{
+        let message = receive_message(&mut stream)?;
+
+        match message {
+            Message::TileResult {id,bytes} =>{
+                let bytes_per_row = image_width * 3;
+                let start = (id * bytes_per_row * chunk_height) as usize;
+                let end = start + (chunk_height * bytes_per_row) as usize;
+
+                result.lock().unwrap()[start..end].copy_from_slice(&bytes);
+
+                let job = jobs.lock().unwrap().pop();
+                match job {
+                    Some(job) => {
+                        send_message(&mut stream,&job)?;
+                    }
+                    None => {
+                        send_message(&mut stream,&Message::Finished)?;
+                        break;
+                    }
+                }
+            }
+            _=>{}
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:9000")?;
+
+    let (scene,camera) = init_scene();
+
+    let height = camera.width/CHUNKS;
+    let jobs = Arc::new(Mutex::new((0..CHUNKS).map(|id|{
+        Message::RenderTile {
+            id,
+            tile: Tile {
+                x: 0,
+                y: height*id,
+                width: camera.width,
+                height,
+            },
+        }
+    }).collect::<Vec<_>>()));
+
+    let result = Arc::new(Mutex::new(vec![0;(camera.width*camera.height*3) as usize]));
+    let mut handles = Vec::new();
+
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                let peer = stream.peer_addr()?;
+                println!("Client connected: {peer}");
+
+                let scene = scene.clone();
+                let camera = camera.clone();
+                let jobs = jobs.clone();
+                let result = result.clone();
+
+                handles.push(thread::spawn(move || {
+                    if let Err(error) = handle_client(stream,camera,scene,jobs,result) {
+                        eprintln!("Client {peer} error: {error}");
+                    }
+                    println!("Client disconnected: {peer}");
+                }));
+
+                if handles.len() >= WORKERS {
+                    break;
+                }
+            }
+            Err(error) => eprintln!("Failed to accept connection: {error}"),
+        }
+    }
+
+    for handle in handles {
+        handle.join().expect("client thread panicked");
+    }
+
+    let image = result.lock().expect("image mutex poisoned").clone();
+    save_png(&image, camera.width, camera.height, "output.png").unwrap();
+
+    Ok(())
+}
+
+fn init_scene() -> (Scene,Camera) {
+    let width = 2048;
+    let height = 2048;
+    let camera = Camera::new(
+        Vec3::new(-0.5, 1.5, 5.0),
+        Vec3::new(0.0, 1.0, 1.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        60.0,
+        width,
+        height,
+        12,
+        128,
+    );
+    let scene = Scene {
+        objects: vec![
+            Object { pos: Vec3::new(0.0, 1.0, 0.0), geometry: Geometry::Sphere { radius: 1.0 }, material_id: 3 },
+            Object { pos: Vec3::new(0.0, 0.5, 2.0), geometry: Geometry::Sphere { radius: 0.5 }, material_id: 1 },
+            Object { pos: Vec3::new(1.5, 0.5, 1.0), geometry: Geometry::Sphere { radius: 0.5 }, material_id: 2 },
+            Object { pos: Vec3::new(-1.5, 0.5, 1.0), geometry: Geometry::Sphere { radius: 0.5 }, material_id: 4 },
+            Object { pos: Vec3::new(-5.0, 0.0, 5.0), geometry: Geometry::Quad { u: Vec3::new(10.0, 0.0, 0.0), v: Vec3::new(0.0, 0.0, -10.0) }, material_id: 0 },
+        ],
+        materials: vec![
+            Material { albedo: Vec3::new(0.8, 0.3, 0.2), kind: MaterialKind::Diffuse },
+            Material { albedo: Vec3::new(0.7, 0.75, 0.8), kind: MaterialKind::Metal { roughness: 0.1 } },
+            Material { albedo: Vec3::new(0.5, 0.4, 0.8), kind: MaterialKind::Emissive },
+            Material { albedo: Vec3::new(0.9, 0.9, 0.9), kind: MaterialKind::Diffuse },
+            Material { albedo: Vec3::new(0.5, 0.8, 0.4), kind: MaterialKind::Emissive },
+        ],
+        background: Vec3::new(0.4, 0.5, 0.7),
+    };
+
+    (scene, camera)
+}
