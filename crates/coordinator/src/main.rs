@@ -80,6 +80,7 @@ fn main() -> io::Result<()> {
     }
 
     println!("Running workers...");
+    let timer = Instant::now();
 
     for handle in handles {
         handle.join().expect("worker thread panicked");
@@ -88,7 +89,7 @@ fn main() -> io::Result<()> {
     let image = result.lock().expect("image mutex poisoned").clone();
     save_png(&image, camera.width, camera.height, "output.png").unwrap();
 
-    println!("Finished successfully");
+    println!("Finished after: {}s", timer.elapsed().as_secs_f32());
     Ok(())
 }
 
